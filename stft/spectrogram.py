@@ -1,14 +1,15 @@
 """Core STFT and spectrogram helpers for the audio editor.
 
-This module is intentionally a red test target: every public function raises
-``NotImplementedError`` until the ten documented defects are fixed.  Audio is
-represented as a plain ``list[float]`` so the implementation only needs the
-Python standard library plus pytest for the tests.
-
-Numeric comparisons in the test suite use an absolute tolerance of ``1e-6``.
+Audio is represented as a plain ``list[float]`` so the implementation only
+needs the Python standard library (``math``/``cmath``) plus pytest for the
+tests.  Numeric comparisons in the test suite use an absolute tolerance of
+``1e-6``.
 """
 
 from __future__ import annotations
+
+import cmath
+import math
 
 __all__ = [
     "StftError",
@@ -25,6 +26,11 @@ __all__ = [
 
 class StftError(Exception):
     """Raised for invalid STFT parameters, data, or batch input."""
+
+
+def _positive_int(value) -> bool:
+    """True only for genuine positive integers (booleans excluded)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def window(n: int, kind: str) -> list[float]:
@@ -52,7 +58,24 @@ def window(n: int, kind: str) -> list[float]:
         A list of ``n`` floats.
     """
 
-    raise NotImplementedError("window() is not implemented")
+    if not _positive_int(n):
+        raise StftError(f"n must be a positive integer, got {n!r}")
+    if kind == "hann":
+        return [
+            0.5 - 0.5 * math.cos(2.0 * math.pi * k / n) for k in range(n)
+        ]
+    if kind == "hamming":
+        return [
+            0.54 - 0.46 * math.cos(2.0 * math.pi * k / n) for k in range(n)
+        ]
+    if kind == "blackman":
+        return [
+            0.42
+            - 0.5 * math.cos(2.0 * math.pi * k / n)
+            + 0.08 * math.cos(4.0 * math.pi * k / n)
+            for k in range(n)
+        ]
+    raise StftError(f"unknown window kind: {kind!r}")
 
 
 def frame(samples: list[float], n_fft: int, hop: int) -> list[list[float]]:
@@ -81,7 +104,37 @@ def frame(samples: list[float], n_fft: int, hop: int) -> list[list[float]]:
         A list of ``n_fft``-long float lists, in time order.
     """
 
-    raise NotImplementedError("frame() is not implemented")
+    if not _positive_int(n_fft):
+        raise StftError(f"n_fft must be a positive integer, got {n_fft!r}")
+    if not _positive_int(hop):
+        # hop=0 would otherwise loop forever in the framing loop.
+        raise StftError(f"hop must be a positive integer, got {hop!r}")
+
+    total = len(samples)
+    if total == 0:
+        return []
+
+    # A non-empty signal shorter than one frame yields exactly one padded
+    # frame.  Otherwise the count follows 1 + (len - n_fft) // hop: this
+    # keeps every full frame instead of dropping the tail and never
+    # over-counts the way ``len // hop`` (plus one) would.
+    if total < n_fft:
+        frame_count = 1
+    else:
+        frame_count = 1 + (total - n_fft) // hop
+    frames: list[list[float]] = []
+    for i in range(frame_count):
+        start = i * hop
+        end = start + n_fft
+        if end <= total:
+            frames.append(list(samples[start:end]))
+        else:
+            # Right-pad the final partial frame with zeros; copy only the
+            # available samples so the caller's list is never mutated.
+            tail = list(samples[start:total])
+            tail.extend([0.0] * (n_fft - len(tail)))
+            frames.append(tail)
+    return frames
 
 
 def rfft(frame: list[float]) -> list[complex]:
@@ -108,7 +161,22 @@ def rfft(frame: list[float]) -> list[complex]:
         ``n // 2 + 1`` complex one-sided spectrum values.
     """
 
-    raise NotImplementedError("rfft() is not implemented")
+    n = len(frame)
+    if n == 0:
+        raise StftError("rfft requires a non-empty frame")
+
+    spectrum: list[complex] = []
+    for k in range(n // 2 + 1):
+        total = 0.0j
+        for t, sample in enumerate(frame):
+            total += sample * cmath.exp(-2.0j * math.pi * k * t / n)
+        value = total / n
+        # One-sided amplitude correction: energy in the discarded conjugate
+        # half is folded back in.  DC (and even-length Nyquist) stay as-is.
+        if k != 0 and not (n % 2 == 0 and k == n // 2):
+            value *= 2.0
+        spectrum.append(value)
+    return spectrum
 
 
 def magnitude_db(spec: list[complex], floor_db: float) -> list[float]:
@@ -127,7 +195,19 @@ def magnitude_db(spec: list[complex], floor_db: float) -> list[float]:
         A list of finite floats, one per input bin.
     """
 
-    raise NotImplementedError("magnitude_db() is not implemented")
+    if not math.isfinite(floor_db):
+        raise StftError(f"floor_db must be finite, got {floor_db!r}")
+
+    result: list[float] = []
+    for value in spec:
+        magnitude = abs(value)
+        if magnitude <= 0.0:
+            result.append(floor_db)
+            continue
+        db = 20.0 * math.log10(magnitude)
+        # Clamp so log(0)-style values can never leak -inf into the view.
+        result.append(db if db >= floor_db else floor_db)
+    return result
 
 
 def spectrogram(
@@ -157,7 +237,29 @@ def spectrogram(
         Rows in time order; each row has ``n_fft // 2 + 1`` dB values.
     """
 
-    raise NotImplementedError("spectrogram() is not implemented")
+    # Validate everything up front; window() also rejects an unknown kind.
+    win = window(n_fft, kind)
+    if not _positive_int(hop):
+        raise StftError(f"hop must be a positive integer, got {hop!r}")
+
+    if len(samples) == 0:
+        return []
+
+    db_floor = -120.0
+    rows: list[list[float]] = []
+    for one_frame in frame(samples, n_fft, hop):
+        # A fresh windowed buffer per frame keeps frames isolated.
+        windowed = [sample * coeff for sample, coeff in zip(one_frame, win)]
+        rows.append(magnitude_db(rfft(windowed), db_floor))
+    return rows
+
+
+def _hz_to_mel(freq: float) -> float:
+    return 2595.0 * math.log10(1.0 + freq / 700.0)
+
+
+def _mel_to_hz(mel: float) -> float:
+    return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
 
 
 def mel_filterbank(
@@ -197,7 +299,54 @@ def mel_filterbank(
         ``n_mels`` rows, each with ``n_fft // 2 + 1`` float weights.
     """
 
-    raise NotImplementedError("mel_filterbank() is not implemented")
+    if not _positive_int(n_mels):
+        raise StftError(f"n_mels must be a positive integer, got {n_mels!r}")
+    if not _positive_int(n_fft):
+        raise StftError(f"n_fft must be a positive integer, got {n_fft!r}")
+    if not _positive_int(sample_rate):
+        raise StftError(
+            f"sample_rate must be a positive integer, got {sample_rate!r}"
+        )
+    if not isinstance(fmin, (int, float)) or not math.isfinite(fmin):
+        raise StftError(f"fmin must be finite, got {fmin!r}")
+    if not isinstance(fmax, (int, float)) or not math.isfinite(fmax):
+        raise StftError(f"fmax must be finite, got {fmax!r}")
+
+    nyquist = sample_rate / 2.0
+    upper = min(fmax, nyquist)
+    if fmin < 0.0 or not (fmin < upper):
+        raise StftError(
+            "require 0 <= fmin < min(fmax, sample_rate/2); "
+            f"got fmin={fmin!r}, fmax={fmax!r}, nyquist={nyquist!r}"
+        )
+
+    n_bins = n_fft // 2 + 1
+    mel_min = _hz_to_mel(fmin)
+    mel_max = _hz_to_mel(upper)
+    # n_mels + 2 edges, uniformly spaced in mel space.
+    edges_hz = [
+        _mel_to_hz(mel_min + (mel_max - mel_min) * i / (n_mels + 1))
+        for i in range(n_mels + 2)
+    ]
+
+    bank: list[list[float]] = []
+    for m in range(n_mels):
+        left, center, right = edges_hz[m], edges_hz[m + 1], edges_hz[m + 2]
+        row = [0.0] * n_bins
+        for b in range(n_bins):
+            # FFT bin center frequency in Hz; b never exceeds Nyquist because
+            # the highest edge was clamped to sample_rate / 2.
+            freq = b * sample_rate / n_fft
+            if left <= freq <= center and center > left:
+                weight = (freq - left) / (center - left)
+            elif center < freq <= right and right > center:
+                weight = (right - freq) / (right - center)
+            else:
+                weight = 0.0
+            # Negative zero would break the non-negative weight contract.
+            row[b] = max(0.0, weight)
+        bank.append(row)
+    return bank
 
 
 def to_mel(spec: list[list[float]], bank: list[list[float]]) -> list[list[float]]:
@@ -220,7 +369,31 @@ def to_mel(spec: list[list[float]], bank: list[list[float]]) -> list[list[float]
         A mel spectrogram with ``len(bank)`` rows and ``len(spec)`` columns.
     """
 
-    raise NotImplementedError("to_mel() is not implemented")
+    n_mels = len(bank)
+    n_frames = len(spec)
+    n_bins = len(bank[0]) if n_mels > 0 else 0
+
+    for row in bank:
+        if len(row) != n_bins:
+            raise StftError("ragged mel filterbank: rows have differing widths")
+    for frame_row in spec:
+        if len(frame_row) != n_bins:
+            raise StftError(
+                f"spectrogram width {len(frame_row)} does not match "
+                f"filterbank width {n_bins}"
+            )
+
+    result: list[list[float]] = []
+    for m in range(n_mels):
+        weights = bank[m]
+        mel_row: list[float] = []
+        for t in range(n_frames):
+            frame_row = spec[t]
+            mel_row.append(
+                sum(weights[f] * frame_row[f] for f in range(n_bins))
+            )
+        result.append(mel_row)
+    return result
 
 
 def stft_batch(
@@ -256,4 +429,55 @@ def stft_batch(
         A dict with ordered ids and their corresponding spectrograms.
     """
 
-    raise NotImplementedError("stft_batch() is not implemented")
+    if not isinstance(config, dict):
+        raise StftError(f"config must be a mapping, got {type(config).__name__}")
+    n_fft = config.get("n_fft")
+    hop = config.get("hop")
+    kind = config.get("kind")
+    if not _positive_int(n_fft):
+        raise StftError(
+            f"config n_fft must be a positive integer, got {n_fft!r}"
+        )
+    if not _positive_int(hop):
+        raise StftError(f"config hop must be a positive integer, got {hop!r}")
+    # Reject unknown window kinds before touching any track data.
+    window(n_fft, kind)
+
+    if not isinstance(tracks, list):
+        raise StftError(
+            f"tracks must be a list, got {type(tracks).__name__}"
+        )
+
+    validated: list[tuple[object, list[float]]] = []
+    for index, track in enumerate(tracks):
+        if not isinstance(track, dict):
+            raise StftError(f"track {index} must be a mapping")
+        if "id" not in track:
+            raise StftError(f"track {index} is missing 'id'")
+        if "samples" not in track:
+            raise StftError(f"track {index} is missing 'samples'")
+        track_id = track["id"]
+        try:
+            hash(track_id)
+        except TypeError as exc:
+            raise StftError(
+                f"track {index} id must be hashable"
+            ) from exc
+        samples = track["samples"]
+        if not isinstance(samples, list):
+            raise StftError(
+                f"track {index} samples must be a list, got "
+                f"{type(samples).__name__}"
+            )
+        validated.append((track_id, samples))
+
+    # All inputs are valid; only now do we build results.  Each spectrogram()
+    # call allocates its own frames/window/spectrum buffers, so tracks can
+    # never share or overwrite each other's spectral data.
+    order: list[object] = []
+    spectrograms: list[list[list[float]]] = []
+    for track_id, samples in validated:
+        order.append(track_id)
+        spectrograms.append(spectrogram(samples, n_fft, hop, kind))
+
+    return {"order": order, "spectrograms": spectrograms}
